@@ -258,6 +258,73 @@ struct VirtioGpuResource {
     // handle"), so without this the frame falls to a per-frame CPU copy via pool_scanout_iovecs.
     // Only retained for blobs large enough to be a scanout (POOL_SCANOUT_DMABUF_MIN_SIZE).
     pool_scanout_dmabuf: Option<SafeDescriptor>,
+
+    // A small fd-backed blob: the DRM native-context control page. Its BAR region stays registered
+    // for the VM's lifetime. A guest's stage-2 view of a BAR offset does not follow a later
+    // unregister/re-register, so handing the offset a fresh memfd leaves the guest reading the
+    // previous page. Instead one page per offset is registered once and refreshed after every
+    // command, so whichever offset a context lands on reads current data.
+    persist_offset: Option<u64>,
+    backend_fd: Option<SafeDescriptor>,
+}
+
+/// Copies `len` bytes from the start of one descriptor into another.
+fn copy_persistent_page(
+    from: &SafeDescriptor,
+    to: &SafeDescriptor,
+    len: usize,
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Safe: both descriptors are live mmap-able files owned by this device; the mappings are
+    // released before returning and their lengths match the requested copy.
+    unsafe {
+        let src = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            from.as_raw_fd(),
+            0,
+        );
+        if src == libc::MAP_FAILED {
+            return Err(anyhow::anyhow!("mmap source failed"));
+        }
+        let dst = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            to.as_raw_fd(),
+            0,
+        );
+        if dst == libc::MAP_FAILED {
+            libc::munmap(src, len);
+            return Err(anyhow::anyhow!("mmap destination failed"));
+        }
+        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+        libc::munmap(src, len);
+        libc::munmap(dst, len);
+    }
+    Ok(())
+}
+
+/// Creates the stable page a control-page BAR offset is registered against.
+fn create_persistent_page(len: usize) -> anyhow::Result<SafeDescriptor> {
+    // Safe: memfd_create/ftruncate on a freshly created private file.
+    unsafe {
+        let fd = libc::memfd_create(
+            b"panvk-control\0".as_ptr() as *const libc::c_char,
+            libc::MFD_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(anyhow::anyhow!("memfd_create failed"));
+        }
+        if libc::ftruncate(fd, len as libc::off_t) != 0 {
+            libc::close(fd);
+            return Err(anyhow::anyhow!("ftruncate failed"));
+        }
+        Ok(SafeDescriptor::from_raw_descriptor(fd))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -290,6 +357,8 @@ impl VirtioGpuResource {
             pool_scanout_iovecs: None,
             scanout_blob_map: None,
             pool_scanout_dmabuf: None,
+            persist_offset: None,
+            backend_fd: None,
         }
     }
 
@@ -1232,6 +1301,11 @@ pub struct VirtioGpu {
     /// Deliberately NOT snapshot'd: a fence outstanding across a snapshot degrades to the
     /// synchronous completion the pre-fence code always had.
     pending_flip_fence: Option<base::SafeDescriptor>,
+
+    /// Stable page per BAR offset for small fd-backed blobs (see `persist_offset`).
+    persistent_pages: std::collections::HashMap<u64, SafeDescriptor>,
+    /// Offsets whose persistent page is already registered with the mapper.
+    persistent_registered: std::collections::HashSet<u64>,
 }
 
 // Only the 2D mode is supported. Notes on `VirtioGpu` fields:
@@ -1371,6 +1445,8 @@ impl VirtioGpu {
             udmabuf_driver,
             deferred_snapshot_load: None,
             pending_flip_fence: None,
+            persistent_pages: Default::default(),
+            persistent_registered: Default::default(),
             snapshot_scratch_directory,
         })
     }
@@ -1939,7 +2015,7 @@ impl VirtioGpu {
             // arrive. Drop the BAR mapping here as well; otherwise the stale mapping stays at
             // that offset and the next context's MAP_BLOB silently reuses it. Pool-resident
             // blobs were never runtime-SHARE'd, so they have no mapping to remove.
-            if resource.pool_offset.is_none() {
+            if resource.pool_offset.is_none() && resource.persist_offset.is_none() {
                 if let Some(shmem_offset) = resource.shmem_offset {
                     // The mapper is keyed by offset, so an offset already re-registered by a
                     // live resource belongs to that resource; leave it alone. (A re-mapped
@@ -2295,6 +2371,70 @@ impl VirtioGpu {
             MemCacheType::CacheCoherent
         };
 
+        // Small fd-backed blobs are the DRM native-context control page (see persist_offset): one
+        // page per BAR offset, registered once and refreshed after every command. A later context
+        // landing on the same offset reuses it, because a guest's stage-2 entry for an offset does
+        // not follow a re-registration.
+        if let Some(VmMemorySource::Descriptor {
+            descriptor,
+            offset: 0,
+            size,
+        }) = source.take()
+        {
+            if size <= 65536 {
+                let len = size as usize;
+                if self.persistent_pages.contains_key(&offset) {
+                    base::warn!(
+                        "GPU-MAPBLOB: res={} control page already registered at offset={:#x}",
+                        resource_id,
+                        offset
+                    );
+                    resource.persist_offset = Some(offset);
+                    resource.backend_fd = Some(descriptor);
+                    resource.shmem_offset = Some(offset);
+                    return Ok(OkMapInfo {
+                        map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+                        pool_offset: None,
+                    });
+                }
+                match create_persistent_page(len) {
+                    Ok(page) => {
+                        if copy_persistent_page(&descriptor, &page, len).is_ok() {
+                            if let Ok(keep) = page.try_clone() {
+                                self.persistent_pages.insert(offset, keep);
+                            }
+                            resource.persist_offset = Some(offset);
+                            resource.backend_fd = Some(descriptor);
+                            source = Some(VmMemorySource::Descriptor {
+                                descriptor: page,
+                                offset: 0,
+                                size,
+                            });
+                        } else {
+                            source = Some(VmMemorySource::Descriptor {
+                                descriptor,
+                                offset: 0,
+                                size,
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        source = Some(VmMemorySource::Descriptor {
+                            descriptor,
+                            offset: 0,
+                            size,
+                        });
+                    }
+                }
+            } else {
+                source = Some(VmMemorySource::Descriptor {
+                    descriptor,
+                    offset: 0,
+                    size,
+                });
+            }
+        }
+
         let res_size = resource.size;
         // The guest-side memparcel accept is always driven host-side over the
         // virtio-gunyah-accept transport (VmAccept::Sync), so nothing about it reaches the
@@ -2356,6 +2496,12 @@ impl VirtioGpu {
         // out of its own blessed RAM), so there is no host mapping to remove. The pool
         // sub-allocation is returned to the pool on the host side by gfxstream at vkFreeMemory.
         if resource.pool_offset.take().is_some() {
+            return Ok(OkNoData);
+        }
+
+        // A control-page offset keeps its stable page registered for the VM's lifetime; tearing it
+        // down here would put a later context back on the un-followed re-registration path.
+        if resource.persist_offset.take().is_some() {
             return Ok(OkNoData);
         }
 
@@ -2428,7 +2574,28 @@ impl VirtioGpu {
         fence_ids: &[u64],
     ) -> VirtioGpuResult {
         self.rutabaga.submit_command(ctx_id, commands, fence_ids)?;
+        self.refresh_persistent_pages();
         Ok(OkNoData)
+    }
+
+    /// Re-copies every control page the renderer writes responses into. The guest reads the page
+    /// registered at its BAR offset, which is this device's copy, not the renderer's (see
+    /// `VirtioGpuResource::persist_offset`).
+    fn refresh_persistent_pages(&mut self) {
+        let mut updates = Vec::new();
+        for res in self.resources.values() {
+            if let (Some(offset), Some(fd)) = (res.persist_offset, res.backend_fd.as_ref()) {
+                if let Ok(dup) = fd.try_clone() {
+                    updates.push((offset, dup, res.size));
+                }
+            }
+        }
+        for (offset, fd, size) in updates {
+            if let Some(page) = self.persistent_pages.get(&offset) {
+                let len = (size as usize).min(65536);
+                let _ = copy_persistent_page(&fd, page, len);
+            }
+        }
     }
 
     // Non-public function -- no doc comment needed!
