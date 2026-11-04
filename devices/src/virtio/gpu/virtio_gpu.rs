@@ -2401,7 +2401,23 @@ impl VirtioGpu {
                 }
                 match create_persistent_page(len) {
                     Ok(page) => {
-                        if copy_persistent_page(&descriptor, &page, len).is_ok() {
+                        let copied = copy_persistent_page(&descriptor, &page, len).is_ok();
+                        if copied {
+                            let mut hdr = [0u32; 2];
+                            if let Ok(map) = MemoryMappingBuilder::new(8)
+                                .from_descriptor(&page)
+                                .build()
+                            {
+                                hdr.copy_from_slice(&map.as_slice()[..8]);
+                            }
+                            base::warn!(
+                                "GPU-MAPBLOB: res={} control page fresh offset={:#x} copied={} hdr=[{},{}]",
+                                resource_id,
+                                offset,
+                                copied,
+                                hdr[0],
+                                hdr[1]
+                            );
                             if let Ok(keep) = page.try_clone() {
                                 self.persistent_pages.insert(offset, keep);
                             }
@@ -2413,6 +2429,11 @@ impl VirtioGpu {
                                 size,
                             });
                         } else {
+                            base::warn!(
+                                "GPU-MAPBLOB: res={} control page copy failed offset={:#x}",
+                                resource_id,
+                                offset
+                            );
                             source = Some(VmMemorySource::Descriptor {
                                 descriptor,
                                 offset: 0,
