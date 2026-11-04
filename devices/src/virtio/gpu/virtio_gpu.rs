@@ -312,10 +312,12 @@ fn copy_persistent_page(
 fn create_persistent_page(len: usize) -> anyhow::Result<SafeDescriptor> {
     // Safe: memfd_create/ftruncate on a freshly created private file.
     unsafe {
-        let fd = libc::memfd_create(
+        // libc exposes memfd_create only for some targets, so go through the syscall directly.
+        let fd = libc::syscall(
+            libc::SYS_memfd_create,
             b"panvk-control\0".as_ptr() as *const libc::c_char,
             libc::MFD_CLOEXEC,
-        );
+        ) as libc::c_int;
         if fd < 0 {
             return Err(anyhow::anyhow!("memfd_create failed"));
         }
