@@ -1510,6 +1510,21 @@ impl SharedMemoryMapper for VmRequester {
             }
         }
 
+        // A BAR offset is one slot. A guest that drops a DRM context without sending
+        // RESOURCE_UNREF leaves the previous resource's region registered here, so registering
+        // the next mapping on top would keep the guest's stage-2 on the old memory. This is the
+        // same hazard add_mapping_blob already guards; fd-backed resources (virglrenderer's
+        // shmem blob is one) come through this path.
+        if let Some(old_id) = self.mappings.remove(&offset) {
+            base::warn!(
+                "add_mapping: replacing existing mapping at offset {:#x}",
+                offset
+            );
+            self.vm_memory_client
+                .unregister_memory(old_id)
+                .context("unregister_memory of replaced mapping failed")?;
+        }
+
         let id = self
             .vm_memory_client
             .register_memory(
