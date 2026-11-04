@@ -2408,7 +2408,12 @@ impl VirtioGpu {
                                 .from_descriptor(&page)
                                 .build()
                             {
-                                hdr.copy_from_slice(&map.as_slice()[..8]);
+                                // Safe: the mapping covers 8 bytes, which the header occupies.
+                                unsafe {
+                                    let p = map.as_ptr() as *const u32;
+                                    hdr[0] = std::ptr::read_volatile(p);
+                                    hdr[1] = std::ptr::read_volatile(p.add(1));
+                                }
                             }
                             base::warn!(
                                 "GPU-MAPBLOB: res={} control page fresh offset={:#x} copied={} hdr=[{},{}]",
