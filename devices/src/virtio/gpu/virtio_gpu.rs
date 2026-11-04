@@ -1934,6 +1934,38 @@ impl VirtioGpu {
                 DisplayImportState::Unknown,
             );
 
+            // A guest can destroy its context before releasing the context's host-visible blobs
+            // (DRM postclose sends CTX_DESTROY first), so the explicit UNMAP_BLOB may never
+            // arrive. Drop the BAR mapping here as well; otherwise the stale mapping stays at
+            // that offset and the next context's MAP_BLOB silently reuses it. Pool-resident
+            // blobs were never runtime-SHARE'd, so they have no mapping to remove.
+            if resource.pool_offset.is_none() {
+                if let Some(shmem_offset) = resource.shmem_offset {
+                    // The mapper is keyed by offset, so an offset already re-registered by a
+                    // live resource belongs to that resource; leave it alone. (A re-mapped
+                    // resource can itself hold more than one offset; only the one it currently
+                    // reports is released here, matching resource_unmap_blob.)
+                    if self
+                        .resources
+                        .values()
+                        .any(|r| r.shmem_offset == Some(shmem_offset))
+                    {
+                        base::warn!(
+                            "unref_resource: offset {:#x} is mapped by another resource, keeping it",
+                            shmem_offset
+                        );
+                    } else {
+                        self.mapper
+                            .lock()
+                            .as_mut()
+                            .expect("No backend request connection found")
+                            .remove_mapping(shmem_offset)
+                            .map_err(|_| ErrUnspec)?;
+                        resource.shmem_offset = None;
+                    }
+                }
+            }
+
             if resource.rutabaga_external_mapping {
                 self.rutabaga.unmap(resource_id)?;
                 resource.rutabaga_external_mapping = false;

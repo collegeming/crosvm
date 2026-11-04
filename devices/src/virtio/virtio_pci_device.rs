@@ -1546,6 +1546,20 @@ impl SharedMemoryMapper for VmRequester {
             self.prepared = true;
         }
 
+        // A BAR offset is one slot: if a mapping from an older resource is still registered
+        // there (its UNMAP_BLOB/UNREF never reached us), registering the new blob on top would
+        // leave the guest's shared region pointing at the previous memory. Remove the stale
+        // region first. The map is keyed by offset, so a source's other offsets are untouched.
+        if let Some(old_id) = self.mappings.remove(&offset) {
+            base::warn!(
+                "add_mapping_blob: replacing existing mapping at offset {:#x}",
+                offset
+            );
+            self.vm_memory_client
+                .unregister_memory(old_id)
+                .context("unregister_memory of replaced mapping failed")?;
+        }
+
         let (id, gunyah_handle) = self
             .vm_memory_client
             .register_memory_for_blob(
