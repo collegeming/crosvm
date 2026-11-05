@@ -2247,6 +2247,15 @@ impl VirtioGpu {
     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
     pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> VirtioGpuResult {
+        if let Some(res) = self.resources.get(&resource_id) {
+            base::warn!(
+                "GPU-MAP: res={} guest_offset={:#x} size={:#x} blob_id={}",
+                resource_id,
+                offset,
+                res.size,
+                res.blob_id
+            );
+        }
         // PRE-ALLOC, either renderer: a pool-resident blob is already in the guest's stage-2
         // (its pool was SHARE-blessed at boot). Don't runtime-SHARE anything and don't touch the
         // BAR -- just tell the guest its pool byte offset. It maps pool_gpa + offset directly
