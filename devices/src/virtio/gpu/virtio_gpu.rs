@@ -1308,6 +1308,8 @@ pub struct VirtioGpu {
     persistent_pages: std::collections::HashMap<u64, SafeDescriptor>,
     /// Offsets whose persistent page is already registered with the mapper.
     persistent_registered: std::collections::HashSet<u64>,
+    /// Remaining `GPU-PERSIST` log lines, so a busy guest cannot flood the log.
+    persist_log_budget: u32,
 }
 
 // Only the 2D mode is supported. Notes on `VirtioGpu` fields:
@@ -1449,6 +1451,7 @@ impl VirtioGpu {
             pending_flip_fence: None,
             persistent_pages: Default::default(),
             persistent_registered: Default::default(),
+            persist_log_budget: 12,
             snapshot_scratch_directory,
         })
     }
@@ -2601,9 +2604,53 @@ impl VirtioGpu {
         commands: &mut [u8],
         fence_ids: &[u64],
     ) -> VirtioGpuResult {
+        self.flush_persistent_pages();
         self.rutabaga.submit_command(ctx_id, commands, fence_ids)?;
         self.refresh_persistent_pages();
         Ok(OkNoData)
+    }
+
+    /// Carries guest writes into the renderer's control page before a submit. `drm_context` reads
+    /// the response copy length from that page (`rsp->len`), and the guest sets it, so a one-way
+    /// renderer→guest copy leaves the renderer seeing zero and every response comes back empty.
+    fn flush_persistent_pages(&mut self) {
+        let mut updates = Vec::new();
+        for res in self.resources.values() {
+            if let (Some(offset), Some(fd)) = (res.persist_offset, res.backend_fd.as_ref()) {
+                if let Ok(dup) = fd.try_clone() {
+                    updates.push((offset, dup, res.size));
+                }
+            }
+        }
+        let mut budget = self.persist_log_budget;
+        for (offset, fd, size) in updates {
+            let Some(page) = self.persistent_pages.get(&offset) else {
+                continue;
+            };
+            let len = (size as usize).min(65536);
+            if budget != 0 {
+                // Safe: the mapping covers the page's seqno and response length fields.
+                if let Ok(map) = MemoryMappingBuilder::new(16).from_descriptor(page).build() {
+                    unsafe {
+                        let p = map.as_ptr() as *const u32;
+                        base::warn!(
+                            "GPU-PERSIST: offset={:#x} guest seqno={} rsp_len={} -> renderer",
+                            offset,
+                            std::ptr::read_volatile(p),
+                            std::ptr::read_volatile(p.add(2))
+                        );
+                    }
+                }
+                budget -= 1;
+            }
+            if copy_persistent_page(page, &fd, len).is_err() {
+                base::warn!(
+                    "GPU-PERSIST: guest->renderer copy failed offset={:#x}",
+                    offset
+                );
+            }
+        }
+        self.persist_log_budget = budget;
     }
 
     /// Re-copies every control page the renderer writes responses into. The guest reads the page
