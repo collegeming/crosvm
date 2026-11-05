@@ -266,6 +266,8 @@ struct VirtioGpuResource {
     // command, so whichever offset a context lands on reads current data.
     persist_offset: Option<u64>,
     backend_fd: Option<SafeDescriptor>,
+    /// Blob id the guest passed at create time: 0 marks the DRM control page.
+    blob_id: u64,
 }
 
 /// Copies `len` bytes from the start of one descriptor into another.
@@ -361,6 +363,7 @@ impl VirtioGpuResource {
             pool_scanout_dmabuf: None,
             persist_offset: None,
             backend_fd: None,
+            blob_id: 0,
         }
     }
 
@@ -2208,6 +2211,7 @@ impl VirtioGpu {
             None
         };
 
+        let created_blob_id = resource_create_blob.blob_id;
         let create_result = self.rutabaga.resource_create_blob(
             ctx_id,
             resource_id,
@@ -2226,6 +2230,7 @@ impl VirtioGpu {
         create_result?;
 
         let mut resource = VirtioGpuResource::new(resource_id, 0, 0, resource_create_blob.size);
+        resource.blob_id = created_blob_id;
         resource.pool_scanout_iovecs = pool_iovecs;
         resource.pool_refs = pool_refs;
         resource.pool_scanout_dmabuf = pool_scanout_dmabuf;
@@ -2386,7 +2391,11 @@ impl VirtioGpu {
             size,
         }) = source.take()
         {
-            if size <= 65536 {
+            // Only the DRM control page (blob_id 0) gets the stable-page treatment. Every other
+            // blob keeps its renderer fd mapped directly: the guest polls the queue io page for
+            // the extract counter and reads back GPU writes, and a mirrored page would serve
+            // both stale until the next submit.
+            if size <= 65536 && resource.blob_id == 0 {
                 let len = size as usize;
                 if self.persistent_pages.contains_key(&offset) {
                     base::warn!(
